@@ -1,26 +1,26 @@
 
 #include "xdb_search.h"
 
-#include <arpa/inet.h>
-#include <sys/time.h>
+// #include <arpa/inet.h>
+// #include <sys/time.h>
 
 #include <iostream>
+// #include <sys/socket.h>
 
 static void log_exit(const std::string &msg) {
     std::cout << msg << std::endl;
     exit(-1);
 }
 
-static unsigned long long get_time() {
-    struct timeval tv1;
-    gettimeofday(&tv1, NULL);
-    return (unsigned long long)tv1.tv_sec * 1000 * 1000 + tv1.tv_usec;
-}
+// static unsigned long long get_time() {
+//     struct timeval tv1;
+//     gettimeofday(&tv1, NULL);
+//     return (unsigned long long)tv1.tv_sec * 1000 * 1000 + tv1.tv_usec;
+// }
 
 static void read_bin(int index, char *buf, size_t len, FILE *db) {
     fseek(db, index, SEEK_SET);
-    if (fread(buf, 1, len, db) != len)
-        log_exit(__func__);
+    if (fread(buf, 1, len, db) != len) log_exit(__func__);
 }
 
 static unsigned int read_uint(const char *buf) {
@@ -32,10 +32,136 @@ static unsigned short read_ushort(const char *buf) {
     return ((buf[0]) & 0x000000FF) | ((buf[1] << 8) & 0x0000FF00);
 }
 
+#include <cctype>
+#include <cstdint>
+#include <sstream>
+#include <string>
+#include <vector>
+
+enum {
+    AF_INET,
+    AF_INET6
+};
+
+int inet_pton(int af, const char *src, void *dst) {
+    if (af == AF_INET) {
+        // IPv4 解析逻辑
+        std::string ip_str(src);
+        std::vector<std::string> parts;
+        std::istringstream iss(ip_str);
+        std::string part;
+
+        while (std::getline(iss, part, '.')) {
+            if (part.empty() || part.size() > 3) return 0;
+            for (char c : part) {
+                if (!std::isdigit(c)) return 0;
+            }
+            parts.push_back(part);
+        }
+
+        if (parts.size() != 4) return 0;
+
+        uint32_t addr = 0;
+        for (int i = 0; i < 4; ++i) {
+            uint32_t byte = std::stoi(parts[i]);
+            if (byte > 255) return 0;
+            addr = (addr << 8) | byte;
+        }
+
+        // 转换为网络字节序（大端序）
+        addr = ((addr & 0xFF000000) >> 24) | ((addr & 0x00FF0000) >> 8) |
+               ((addr & 0x0000FF00) << 8) | ((addr & 0x000000FF) << 24);
+
+        *reinterpret_cast<uint32_t *>(dst) = addr;
+        return 1;
+    }
+
+    if (af == AF_INET6) {
+        // IPv6 解析逻辑
+        std::string ip_str(src);
+        std::vector<std::string> parts;
+        size_t double_colon = ip_str.find("::");
+
+        if (double_colon != std::string::npos) {
+            // 处理双冒号压缩格式
+            std::string left = ip_str.substr(0, double_colon);
+            std::string right = ip_str.substr(double_colon + 2);
+
+            std::istringstream left_iss(left);
+            std::string left_part;
+            while (std::getline(left_iss, left_part, ':')) {
+                if (!left_part.empty())
+                    parts.push_back(left_part);
+                else
+                    return 0;
+            }
+
+            parts.push_back(""); // 标记双冒号位置
+
+            std::istringstream right_iss(right);
+            std::string right_part;
+            while (std::getline(right_iss, right_part, ':')) {
+                if (!right_part.empty())
+                    parts.push_back(right_part);
+                else
+                    return 0;
+            }
+        }
+        else {
+            // 处理完整格式
+            std::istringstream iss(ip_str);
+            std::string part;
+            while (std::getline(iss, part, ':')) {
+                if (part.empty()) return 0;
+                parts.push_back(part);
+            }
+        }
+
+        // 处理双冒号压缩后的段数
+        int gap = 8 - static_cast<int>(parts.size());
+        std::vector<std::string> expanded;
+        bool inserted = false;
+
+        for (const auto &p : parts) {
+            if (p.empty() && !inserted) {
+                for (int i = 0; i <= gap; ++i) {
+                    expanded.push_back("0000");
+                }
+                inserted = true;
+            }
+            else {
+                expanded.push_back(p);
+            }
+        }
+
+        if (expanded.size() != 8) return 0;
+
+        uint8_t *addr = reinterpret_cast<uint8_t *>(dst);
+        for (int i = 0; i < 8; ++i) {
+            std::string hex_str = expanded[i];
+            if (hex_str.size() > 4) return 0;
+            for (char c : hex_str) {
+                if (!std::isxdigit(c)) return 0;
+            }
+
+            uint16_t value = std::stoi(hex_str, nullptr, 16);
+            addr[i * 2] =
+                static_cast<uint8_t>((value >> 8) & 0xFF); // 大端序高位在前
+            addr[i * 2 + 1] = static_cast<uint8_t>(value & 0xFF);
+        }
+        return 1;
+    }
+
+    return -1; // 不支持的地址族
+}
+
+struct in_addr {
+    uint32_t s_addr;
+};
+
 static bool ip2uint(const char *buf, unsigned int &ip) {
     struct in_addr addr;
-    if (inet_pton(AF_INET, buf, &addr) == 0)
-        return false;
+    if (inet_pton(AF_INET, buf, &addr) == 0) return false;
     // 网络字节序为大端存储, 在此转换为小端存储
     ip = (((addr.s_addr >> 0) & 0xFF) << 24) |
          (((addr.s_addr >> 8) & 0xFF) << 16) |
@@ -44,53 +170,54 @@ static bool ip2uint(const char *buf, unsigned int &ip) {
     return true;
 }
 
-void xdb_search_t::get_content_index(unsigned int  ip,
-                                     unsigned int &left,
-                                     unsigned int &right) {
-    unsigned int ip_1  = (ip >> 24) & 0xFF;
-    unsigned int ip_2  = (ip >> 16) & 0xFF;
+void xdb_search_t::get_content_index(
+    unsigned int ip, unsigned int &left, unsigned int &right) {
+    unsigned int ip_1 = (ip >> 24) & 0xFF;
+    unsigned int ip_2 = (ip >> 16) & 0xFF;
     unsigned int index = (ip_1 * vector_index_cols + ip_2) * vector_index_size;
 
     if (content != NULL) {
-        left  = read_uint(content + index + header_length);
+        left = read_uint(content + index + header_length);
         right = read_uint(content + index + header_length + 4);
-    } else if (vector_index != NULL) {
-        left  = read_uint(vector_index + index);
+    }
+    else if (vector_index != NULL) {
+        left = read_uint(vector_index + index);
         right = read_uint(vector_index + index + 4);
-    } else {
+    }
+    else {
         ++io_count;
         char buf[8];
         read_bin(header_length + index, buf, sizeof(buf), db);
-        left  = read_uint(buf);
+        left = read_uint(buf);
         right = read_uint(buf + 4);
     }
 }
 
-void xdb_search_t::get_content(unsigned int    index,
-                               unsigned int   &ip_left,
-                               unsigned int   &ip_right,
-                               unsigned short &region_len,
-                               unsigned int   &region_index) {
-    char        buf[segment_index_size];  // 4 + 4 + 2 + 4
+void xdb_search_t::get_content(unsigned int index, unsigned int &ip_left,
+    unsigned int &ip_right, unsigned short &region_len,
+    unsigned int &region_index) {
+    char buf[segment_index_size]; // 4 + 4 + 2 + 4
     const char *p;
 
     if (content != NULL) {
         p = content + index;
-    } else {
+    }
+    else {
         ++io_count;
         read_bin(index, buf, sizeof(buf), db);
         p = buf;
     }
-    ip_left      = read_uint(p);
-    ip_right     = read_uint(p + 4);
-    region_len   = read_ushort(p + 8);
+    ip_left = read_uint(p);
+    ip_right = read_uint(p + 4);
+    region_len = read_ushort(p + 8);
     region_index = read_uint(p + 10);
 }
 
 std::string xdb_search_t::get_region(unsigned int index, unsigned short len) {
     if (content != NULL) {
         return std::string(content + index, len);
-    } else {
+    }
+    else {
         ++io_count;
         char *buf = (char *)malloc(sizeof(char) * len);
         read_bin(index, buf, len, db);
@@ -101,16 +228,14 @@ std::string xdb_search_t::get_region(unsigned int index, unsigned short len) {
 }
 
 xdb_search_t::xdb_search_t(const std::string &file_name) {
-    db           = fopen(file_name.data(), "r");
+    db = fopen(file_name.data(), "r");
     vector_index = NULL;
-    content      = NULL;
+    content = NULL;
 
-    if (db == NULL)
-        log_exit("can't open " + file_name);
+    if (db == NULL) log_exit("can't open " + file_name);
 }
 
-void xdb_search_t::init_file() {
-}
+void xdb_search_t::init_file() {}
 
 void xdb_search_t::init_vector_index() {
     vector_index = (char *)malloc(vector_index_length);
@@ -120,7 +245,7 @@ void xdb_search_t::init_vector_index() {
 void xdb_search_t::init_content() {
     fseek(db, 0, SEEK_END);
     unsigned int size = ftell(db);
-    content           = (char *)malloc(size);
+    content = (char *)malloc(size);
     read_bin(0, content, size, db);
 }
 
@@ -148,15 +273,14 @@ unsigned long long xdb_search_t::get_cost_time() {
 }
 
 std::string xdb_search_t::search(const std::string &ip_str) {
-    unsigned long long t1 = get_time();
+    // unsigned long long t1 = get_time();
 
     unsigned int ip_uint;
-    if (!ip2uint(ip_str.data(), ip_uint))
-        return "invalid ip: " + ip_str;
+    if (!ip2uint(ip_str.data(), ip_uint)) return "invalid ip: " + ip_str;
     std::string region = search(ip_uint);
 
-    unsigned long long t2 = get_time();
-    cost_time             = t2 - t1;
+    // unsigned long long t2 = get_time();
+    // cost_time             = t2 - t1;
     return region;
 }
 
@@ -166,17 +290,17 @@ std::string xdb_search_t::search(unsigned int ip_uint) {
     unsigned int content_index_left, content_index_right;
     get_content_index(ip_uint, content_index_left, content_index_right);
 
-    unsigned int   left, right, mid;
-    unsigned int   ip_left, ip_right;
+    unsigned int left, right, mid;
+    unsigned int ip_left, ip_right;
     unsigned short region_len;
-    unsigned int   region_index;
-    unsigned int   mid_index;
+    unsigned int region_index;
+    unsigned int mid_index;
 
-    left  = 0;
+    left = 0;
     right = (content_index_right - content_index_left) / segment_index_size;
 
     for (;;) {
-        mid       = left + (right - left) / 2;
+        mid = left + (right - left) / 2;
         mid_index = content_index_left + mid * segment_index_size;
         get_content(mid_index, ip_left, ip_right, region_len, region_index);
 
