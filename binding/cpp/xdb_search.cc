@@ -20,7 +20,8 @@ static void log_exit(const std::string &msg) {
 
 static void read_bin(int index, char *buf, size_t len, FILE *db) {
     fseek(db, index, SEEK_SET);
-    if (fread(buf, 1, len, db) != len) log_exit(__func__);
+    int rd = fread(buf, 1, len, db);
+    if (rd != len) log_exit(__func__);
 }
 
 static unsigned int read_uint(const char *buf) {
@@ -228,7 +229,7 @@ std::string xdb_search_t::get_region(unsigned int index, unsigned short len) {
 }
 
 xdb_search_t::xdb_search_t(const std::string &file_name) {
-    db = fopen(file_name.data(), "r");
+    db = fopen(file_name.data(), "rb");
     vector_index = NULL;
     content = NULL;
 
