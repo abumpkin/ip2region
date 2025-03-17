@@ -33,12 +33,6 @@ static unsigned short read_ushort(const char *buf) {
     return ((buf[0]) & 0x000000FF) | ((buf[1] << 8) & 0x0000FF00);
 }
 
-#include <cctype>
-#include <cstdint>
-#include <sstream>
-#include <string>
-#include <vector>
-
 enum {
     AF_INET,
     AF_INET6
@@ -47,27 +41,25 @@ enum {
 int inet_pton(int af, const char *src, void *dst) {
     if (af == AF_INET) {
         // IPv4 解析逻辑
-        std::string ip_str(src);
-        std::vector<std::string> parts;
-        std::istringstream iss(ip_str);
-        std::string part;
-
-        while (std::getline(iss, part, '.')) {
-            if (part.empty() || part.size() > 3) return 0;
-            for (char c : part) {
-                if (!std::isdigit(c)) return 0;
-            }
-            parts.push_back(part);
-        }
-
-        if (parts.size() != 4) return 0;
-
         uint32_t addr = 0;
-        for (int i = 0; i < 4; ++i) {
-            uint32_t byte = std::stoi(parts[i]);
-            if (byte > 255) return 0;
-            addr = (addr << 8) | byte;
+        int part = 0;
+        int dot_count = 0;
+
+        for (const char *p = src; *p; ++p) {
+            if (*p == '.') {
+                if (part < 0 || part > 255 || dot_count >= 3) return 0;
+                addr = (addr << 8) | static_cast<uint8_t>(part);
+                part = 0;
+                ++dot_count;
+            } else if (std::isdigit(*p)) {
+                part = part * 10 + (*p - '0');
+            } else {
+                return 0;
+            }
         }
+
+        if (dot_count != 3 || part < 0 || part > 255) return 0;
+        addr = (addr << 8) | static_cast<uint8_t>(part);
 
         // 转换为网络字节序（大端序）
         addr = ((addr & 0xFF000000) >> 24) | ((addr & 0x00FF0000) >> 8) |
@@ -79,82 +71,194 @@ int inet_pton(int af, const char *src, void *dst) {
 
     if (af == AF_INET6) {
         // IPv6 解析逻辑
-        std::string ip_str(src);
-        std::vector<std::string> parts;
-        size_t double_colon = ip_str.find("::");
+        uint8_t *addr = reinterpret_cast<uint8_t *>(dst);
+        int part_count = 0;
+        int gap_pos = -1;
+        const char *p = src;
 
-        if (double_colon != std::string::npos) {
-            // 处理双冒号压缩格式
-            std::string left = ip_str.substr(0, double_colon);
-            std::string right = ip_str.substr(double_colon + 2);
-
-            std::istringstream left_iss(left);
-            std::string left_part;
-            while (std::getline(left_iss, left_part, ':')) {
-                if (!left_part.empty())
-                    parts.push_back(left_part);
-                else
-                    return 0;
-            }
-
-            parts.push_back(""); // 标记双冒号位置
-
-            std::istringstream right_iss(right);
-            std::string right_part;
-            while (std::getline(right_iss, right_part, ':')) {
-                if (!right_part.empty())
-                    parts.push_back(right_part);
-                else
-                    return 0;
-            }
+        // 处理双冒号压缩格式
+        if (*p == ':') {
+            if (*++p != ':') return 0;
+            gap_pos = 0;
+            ++p;
         }
-        else {
-            // 处理完整格式
-            std::istringstream iss(ip_str);
-            std::string part;
-            while (std::getline(iss, part, ':')) {
-                if (part.empty()) return 0;
-                parts.push_back(part);
+
+        while (*p) {
+            if (part_count >= 8) return 0;
+
+            if (*p == ':') {
+                if (gap_pos != -1) return 0; // 多个双冒号
+                gap_pos = part_count;
+                ++p;
+                if (*p == ':') ++p; // 处理双冒号
+            }
+
+            uint16_t value = 0;
+            int digit_count = 0;
+
+            while (std::isxdigit(*p)) {
+                value = (value << 4) | (std::isdigit(*p) ? (*p - '0') : (std::tolower(*p) - 'a' + 10));
+                ++p;
+                ++digit_count;
+                if (digit_count > 4) return 0; // 每个部分最多 4 个十六进制字符
+            }
+
+            addr[part_count * 2] = static_cast<uint8_t>((value >> 8) & 0xFF);
+            addr[part_count * 2 + 1] = static_cast<uint8_t>(value & 0xFF);
+            ++part_count;
+
+            if (*p == ':') {
+                if (gap_pos != -1) return 0; // 多个双冒号
+                gap_pos = part_count;
+                ++p;
             }
         }
 
         // 处理双冒号压缩后的段数
-        int gap = 8 - static_cast<int>(parts.size());
-        std::vector<std::string> expanded;
-        bool inserted = false;
+        if (gap_pos != -1) {
+            int gap_size = 8 - part_count;
+            if (gap_size < 1) return 0;
 
-        for (const auto &p : parts) {
-            if (p.empty() && !inserted) {
-                for (int i = 0; i <= gap; ++i) {
-                    expanded.push_back("0000");
-                }
-                inserted = true;
+            // 将后面的部分向后移动
+            for (int i = 7; i >= gap_pos + gap_size; --i) {
+                addr[i * 2] = addr[(i - gap_size) * 2];
+                addr[i * 2 + 1] = addr[(i - gap_size) * 2 + 1];
             }
-            else {
-                expanded.push_back(p);
+
+            // 填充 0
+            for (int i = gap_pos; i < gap_pos + gap_size; ++i) {
+                addr[i * 2] = 0;
+                addr[i * 2 + 1] = 0;
             }
+        } else if (part_count != 8) {
+            return 0;
         }
 
-        if (expanded.size() != 8) return 0;
-
-        uint8_t *addr = reinterpret_cast<uint8_t *>(dst);
-        for (int i = 0; i < 8; ++i) {
-            std::string hex_str = expanded[i];
-            if (hex_str.size() > 4) return 0;
-            for (char c : hex_str) {
-                if (!std::isxdigit(c)) return 0;
-            }
-
-            uint16_t value = std::stoi(hex_str, nullptr, 16);
-            addr[i * 2] =
-                static_cast<uint8_t>((value >> 8) & 0xFF); // 大端序高位在前
-            addr[i * 2 + 1] = static_cast<uint8_t>(value & 0xFF);
-        }
         return 1;
     }
 
     return -1; // 不支持的地址族
 }
+
+// #include <cctype>
+// #include <cstdint>
+// #include <sstream>
+// #include <string>
+// #include <vector>
+
+
+
+// int inet_pton(int af, const char *src, void *dst) {
+//     if (af == AF_INET) {
+//         // IPv4 解析逻辑
+//         std::string ip_str(src);
+//         std::vector<std::string> parts;
+//         std::istringstream iss(ip_str);
+//         std::string part;
+
+//         while (std::getline(iss, part, '.')) {
+//             if (part.empty() || part.size() > 3) return 0;
+//             for (char c : part) {
+//                 if (!std::isdigit(c)) return 0;
+//             }
+//             parts.push_back(part);
+//         }
+
+//         if (parts.size() != 4) return 0;
+
+//         uint32_t addr = 0;
+//         for (int i = 0; i < 4; ++i) {
+//             uint32_t byte = std::stoi(parts[i]);
+//             if (byte > 255) return 0;
+//             addr = (addr << 8) | byte;
+//         }
+
+//         // 转换为网络字节序（大端序）
+//         addr = ((addr & 0xFF000000) >> 24) | ((addr & 0x00FF0000) >> 8) |
+//                ((addr & 0x0000FF00) << 8) | ((addr & 0x000000FF) << 24);
+
+//         *reinterpret_cast<uint32_t *>(dst) = addr;
+//         return 1;
+//     }
+
+//     if (af == AF_INET6) {
+//         // IPv6 解析逻辑
+//         std::string ip_str(src);
+//         std::vector<std::string> parts;
+//         size_t double_colon = ip_str.find("::");
+
+//         if (double_colon != std::string::npos) {
+//             // 处理双冒号压缩格式
+//             std::string left = ip_str.substr(0, double_colon);
+//             std::string right = ip_str.substr(double_colon + 2);
+
+//             std::istringstream left_iss(left);
+//             std::string left_part;
+//             while (std::getline(left_iss, left_part, ':')) {
+//                 if (!left_part.empty())
+//                     parts.push_back(left_part);
+//                 else
+//                     return 0;
+//             }
+
+//             parts.push_back(""); // 标记双冒号位置
+
+//             std::istringstream right_iss(right);
+//             std::string right_part;
+//             while (std::getline(right_iss, right_part, ':')) {
+//                 if (!right_part.empty())
+//                     parts.push_back(right_part);
+//                 else
+//                     return 0;
+//             }
+//         }
+//         else {
+//             // 处理完整格式
+//             std::istringstream iss(ip_str);
+//             std::string part;
+//             while (std::getline(iss, part, ':')) {
+//                 if (part.empty()) return 0;
+//                 parts.push_back(part);
+//             }
+//         }
+
+//         // 处理双冒号压缩后的段数
+//         int gap = 8 - static_cast<int>(parts.size());
+//         std::vector<std::string> expanded;
+//         bool inserted = false;
+
+//         for (const auto &p : parts) {
+//             if (p.empty() && !inserted) {
+//                 for (int i = 0; i <= gap; ++i) {
+//                     expanded.push_back("0000");
+//                 }
+//                 inserted = true;
+//             }
+//             else {
+//                 expanded.push_back(p);
+//             }
+//         }
+
+//         if (expanded.size() != 8) return 0;
+
+//         uint8_t *addr = reinterpret_cast<uint8_t *>(dst);
+//         for (int i = 0; i < 8; ++i) {
+//             std::string hex_str = expanded[i];
+//             if (hex_str.size() > 4) return 0;
+//             for (char c : hex_str) {
+//                 if (!std::isxdigit(c)) return 0;
+//             }
+
+//             uint16_t value = std::stoi(hex_str, nullptr, 16);
+//             addr[i * 2] =
+//                 static_cast<uint8_t>((value >> 8) & 0xFF); // 大端序高位在前
+//             addr[i * 2 + 1] = static_cast<uint8_t>(value & 0xFF);
+//         }
+//         return 1;
+//     }
+
+//     return -1; // 不支持的地址族
+// }
 
 struct in_addr {
     uint32_t s_addr;
